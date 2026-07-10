@@ -24,6 +24,8 @@ export interface NotifStore {
   unreadCount(ownerId: string): number
   /** ids 지정 시 해당 항목만, 없으면 전체 읽음 처리. 바뀐 개수 반환. */
   markRead(ownerId: string, ids?: string[]): number
+  /** 알림 전체 지우기(피드 비움) — 지운 개수 반환. 파일은 유지(빈 목록으로 플러시). */
+  clear(ownerId: string): number
   /** 계정 탈퇴 연쇄 — 그 사용자의 알림 파일·캐시 제거. */
   removeForUser(ownerId: string): void
 }
@@ -121,6 +123,15 @@ export function createNotifStore(opts?: { dataDir?: string; persist?: boolean })
       }
       if (changed) flush(ownerId)
       return changed
+    },
+    clear(ownerId) {
+      const items = read(ownerId)
+      const n = items.length
+      if (!n) return 0
+      items.length = 0 // 캐시 배열을 비우고 빈 목록으로 영속(파일은 유지 — removeForUser 와 달리 언링크 안 함)
+      cache.set(ownerId, items)
+      flush(ownerId)
+      return n
     },
     removeForUser(ownerId) {
       cache.delete(ownerId)

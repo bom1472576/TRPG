@@ -1098,6 +1098,21 @@ export function createRelay(opts?: {
       })
       return
     }
+    // 알림 전체 지우기 — 본문 { token }. 본인 피드만 비운다(서버 권위).
+    if (req.method === 'POST' && req.url === '/notif/clear') {
+      void readJsonBody(req).then((body) => {
+        const account = typeof body.token === 'string' ? auth.verifyToken(body.token) : null
+        if (!account) {
+          res.writeHead(401, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: false, error: '인증이 필요합니다.' }))
+          return
+        }
+        notif.clear(account.id)
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true }))
+      })
+      return
+    }
 
     // ===== 블로그/게시글 — 자기 로비의 글. 목록/상세는 토큰 선택(있으면 작성자 권한·내 좋아요 반영). =====
     // 글 목록 — 본문 { token?, target }. 작성자 본인이면 비공개·임시저장 포함, 아니면 공개·비임시만.
