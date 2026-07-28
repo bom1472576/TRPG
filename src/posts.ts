@@ -23,7 +23,10 @@ const MAX_COVER = 1_400_000 // 대표 이미지 data URL 상한(보통은 asset 
 // 에디터가 생성하는 서식 태그만 허용. 그 외 태그는 마커만 제거(텍스트는 보존). 위험 요소는 통째 제거.
 const ALLOWED_TAGS = new Set([
   'p', 'br', 'div', 'span', 'b', 'strong', 'i', 'em', 'u', 's', 'strike',
-  'blockquote', 'h1', 'h2', 'h3', 'h4', 'ul', 'ol', 'li', 'a', 'img', 'hr', 'code', 'pre'
+  'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'a', 'img', 'hr', 'code', 'pre',
+  // 위·아래 첨자와 형광 표시 — 편집기 툴바가 내는 서식.
+  // font 는 넣지 않는다 — 색·크기를 속성으로 들고 오는데 속성은 전부 걷어내므로 빈 껍데기만 남는다.
+  'sub', 'sup', 'mark'
 ])
 // 여는~닫는 태그를 통째로 제거할 위험 요소(스크립트·스타일·삽입 프레임 등).
 const DROP_BLOCKS = [
@@ -31,12 +34,26 @@ const DROP_BLOCKS = [
   'embed', 'svg', 'math', 'form', 'head', 'link', 'meta', 'base', 'button', 'input', 'select'
 ]
 // 허용 인라인 style 속성 — 값에 url(/expression/주석/스킴 없을 때만(CSS 주입 차단).
-// width/max-width=본문 이미지 크기 조절, border-color=구분선(hr) 색.
+// width/max-width=본문 이미지 크기 조절, border-color=구분선(hr) 색,
+// margin/padding/border=들여쓰기(인용 블록), float/display=본문 이미지 정렬.
 const ALLOWED_STYLE_PROPS = new Set([
   'text-align', 'color', 'background-color', 'font-size', 'font-weight',
-  'font-style', 'text-decoration', 'font-family', 'line-height',
-  'width', 'max-width', 'border-color', 'border-top-color'
+  'font-style', 'text-decoration', 'font-family', 'line-height', 'letter-spacing',
+  'width', 'max-width', 'height', 'border-color', 'border-top-color',
+  'margin', 'margin-left', 'margin-right', 'margin-top', 'margin-bottom',
+  'padding', 'padding-left', 'text-indent', 'border', 'float', 'clear',
+  'display', 'vertical-align'
 ])
+/**
+ * 음수를 받아서는 안 되는 속성 — 여백을 크게 음수로 주면 본문이 글 밖으로 삐져나가
+ * 다른 화면 요소를 덮는다. 글쓴이가 남의 화면을 가리는 길을 열지 않는다.
+ */
+const NO_NEGATIVE_PROPS = new Set([
+  'margin', 'margin-left', 'margin-right', 'margin-top', 'margin-bottom',
+  'padding', 'padding-left', 'text-indent', 'width', 'max-width', 'height', 'letter-spacing'
+])
+/** display 는 이미지 정렬(가운데=block)에만 쓴다 — 그 밖의 값은 받지 않는다. */
+const DISPLAY_VALUES = new Set(['block', 'inline', 'inline-block', 'none'])
 
 /** 속성값 이스케이프(쌍따옴표 컨텍스트). */
 function escAttr(s: string): string {
@@ -70,6 +87,9 @@ function sanitizeStyle(v: string): string {
     if (!ALLOWED_STYLE_PROPS.has(prop)) continue
     const value = decl.slice(idx + 1).trim()
     if (/url\s*\(|expression|javascript:|@import|\/\*|<|>/i.test(value)) continue
+    // 음수 여백은 본문 밖으로 내용을 밀어 다른 화면을 덮는 데 쓰인다.
+    if (NO_NEGATIVE_PROPS.has(prop) && /-\s*[\d.]/.test(value)) continue
+    if (prop === 'display' && !DISPLAY_VALUES.has(value.toLowerCase())) continue
     const clean = value.slice(0, 120).replace(/["']/g, '')
     if (clean) out.push(`${prop}: ${clean}`)
   }

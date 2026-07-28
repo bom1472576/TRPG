@@ -372,7 +372,7 @@ export const DEFAULT_LABELS: Record<LabelKey, string> = {
   gacha: '뽑기',
   item: '아이템',
   stamina: '체력',
-  member: '러너',
+  member: '멤버',
   staff: '스탭',
   owner: '관리자'
 }
@@ -380,6 +380,14 @@ const LABEL_KEYS = new Set<string>(Object.keys(DEFAULT_LABELS))
 
 export type Stage = 'prep' | 'open' | 'closed'
 export type JoinMode = 'open' | 'approval' | 'invite'
+
+/**
+ * 커뮤니티 성격.
+ * basic — 게시판 중심의 보통 커뮤니티. 캐릭터·경제·퀘스트·조사 쪽 길을 아예 내주지 않는다.
+ * oc    — 캐릭터를 만들어 활동하는 커뮤니티(경제·놀이 포함). 자료 구조와 저장분은 그대로 두되
+ *         지금은 새로 열 수 없다 — 화면과 라우트가 basic 만 내준다.
+ */
+export type CommunityMode = 'basic' | 'oc'
 
 /** 경제 운영값 — 관리자가 커뮤 성격에 맞춰 조절한다. 0 은 대체로 '그 유입구를 끈다'는 뜻이다. */
 export interface EconSettings {
@@ -413,6 +421,8 @@ export const DEFAULT_ECON: EconSettings = {
 
 export interface CommunitySettings {
   cid: string
+  /** 커뮤니티 성격 — 열 때 정해진다. basic 이면 캐릭터·경제·놀이 기능이 전부 닫힌다. */
+  mode: CommunityMode
   name: string
   tagline: string
   logo: string
@@ -720,10 +730,10 @@ function defaultRoles(): CommunityRole[] {
         'board.viewSecret': 'allow'
       }
     },
-    { id: 'member', name: '러너', color: '#5fd18a', tier: 5, builtin: true, perms: {} },
+    { id: 'member', name: '멤버', color: '#5fd18a', tier: 5, builtin: true, perms: {} },
     {
       id: 'pending',
-      name: '가입 대기',
+      name: '승인대기',
       color: '#9aa3b0',
       tier: 9,
       builtin: true,
@@ -794,7 +804,7 @@ function makeBoard(categoryId: string, kind: BoardKind, name: string, order: num
 }
 
 function defaultTheme(): CommunityTheme {
-  return { preset: '심야 서고', colors: {}, rarityNames: [] }
+  return { preset: '바이올렛 골드', colors: {}, rarityNames: [] }
 }
 
 // ===== 저장소 =====
@@ -809,7 +819,7 @@ export interface CommunityStore {
   /** 커뮤니티가 아직 없으면 null. */
   settings(): CommunitySettings | null
   /** 없으면 만든다(앱 관리자가 처음 들어왔을 때). 이미 있으면 그대로 반환. */
-  ensure(ownerId: string, now: number): CommunitySettings
+  ensure(ownerId: string, now: number, mode?: CommunityMode): CommunitySettings
   member(accountId: string): CommunityMember | null
   members(): CommunityMember[]
   role(roleId: string): CommunityRole | null
@@ -832,6 +842,8 @@ export interface CommunityStore {
   clearSanction(actorTier: number, accountId: string): Result<CommunityMember>
   leave(accountId: string): void
 
+  /** 커뮤니티 성격 전환(서버 주인 전용 — 검증은 라우트). 자료는 그대로 두고 화면·라우트 구성만 갈아탄다. */
+  setMode(mode: unknown, now: number): Result<CommunitySettings>
   saveSettings(input: unknown, now: number): Result<CommunitySettings>
   saveTree(input: unknown, now: number): Result<CommunitySettings>
   saveTheme(theme: unknown, now: number): Result<CommunityTheme>
@@ -912,15 +924,26 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
     if (!d || typeof d !== 'object') return null
     const r = d as Record<string, unknown>
     if (typeof r.cid !== 'string') return null
+    const boards = Array.isArray(r.boards) ? (r.boards as Board[]) : []
+    // 성격 값이 없는 저장분 = 이 값이 생기기 전의 판. 그 시절 개설은 캐릭터·역극·로그 게시판을 반드시
+    // 심었으므로 그 흔적이 있으면 캐릭터 커뮤니티로 본다 — 보통으로 접으면 승인·지갑·파견이 전부 잠긴다.
+    const mode: CommunityMode =
+      r.mode === 'oc' || r.mode === 'basic'
+        ? r.mode
+        : boards.some((b) => b && b.kind !== 'general')
+          ? 'oc'
+          : 'basic'
     const roles = Array.isArray(r.roles) && r.roles.length ? (r.roles as CommunityRole[]) : defaultRoles()
-    // 기본 역할 이름을 '총괄'에서 '관리자'로 바꿨다. 관리자가 직접 고친 이름은 건드리지 않고,
+    // 기본 등급 이름이 몇 차례 바뀌었다. 관리자가 직접 고친 이름은 건드리지 않고,
     // 우리가 붙여 준 옛 기본값 그대로인 것만 새 이름으로 옮긴다.
     for (const role of roles) {
       if (role.id === 'owner' && role.builtin && role.name === '총괄') role.name = '관리자'
+      if (role.id === 'member' && role.builtin && role.name === '러너') role.name = '멤버'
+      if (role.id === 'pending' && role.builtin && role.name === '가입 대기') role.name = '승인대기'
     }
-    const boards = Array.isArray(r.boards) ? (r.boards as Board[]) : []
     return {
       cid: MAIN_CID,
+      mode,
       name: str(r.name, MAX_NAME) || '커뮤니티',
       tagline: str(r.tagline, MAX_TAGLINE),
       logo: assetRef(r.logo),
@@ -1096,28 +1119,33 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
 
     settings: () => settings,
 
-    ensure(ownerId, now) {
+    ensure(ownerId, now, mode = 'basic') {
       if (settings) return settings
       const catId = id()
-      const sysId = id()
-      const categories: Category[] = [
-        { id: catId, name: '안내', order: 0, collapsed: false },
-        { id: sysId, name: '러닝', order: 1, collapsed: false }
-      ]
+      const categories: Category[] = [{ id: catId, name: '안내', order: 0, collapsed: false }]
       const boards: Board[] = [
         makeBoard(catId, 'general', '공지', 0, now, { noticeMax: 10 }),
-        makeBoard(catId, 'general', '자유', 1, now),
-        makeBoard(sysId, 'character', '캐릭터', 2, now),
-        makeBoard(sysId, 'roleplay', '역극', 3, now),
-        makeBoard(sysId, 'log', '로그', 4, now)
+        makeBoard(catId, 'general', '자유', 1, now)
       ]
+      // 캐릭터 커뮤니티로 열 때만 활동 구획을 함께 심는다.
+      if (mode === 'oc') {
+        const sysId = id()
+        categories.push({ id: sysId, name: '러닝', order: 1, collapsed: false })
+        boards.push(
+          makeBoard(sysId, 'character', '캐릭터', 2, now),
+          makeBoard(sysId, 'roleplay', '역극', 3, now),
+          makeBoard(sysId, 'log', '로그', 4, now)
+        )
+      }
       settings = {
         cid: MAIN_CID,
+        mode,
         name: '커뮤니티',
         tagline: '',
         logo: '',
         stage: 'prep',
-        joinMode: 'open',
+        // 승인제가 기본 — 문을 열어 두는 것은 관리자가 뜻을 갖고 고르는 일이다(운영 설정에서 바꾼다).
+        joinMode: 'approval',
         applyForm: [],
         econ: { ...DEFAULT_ECON },
         theme: defaultTheme(),
@@ -1328,6 +1356,19 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
       touchMembers(true)
     },
 
+    setMode(mode, now) {
+      if (!settings) return { ok: false, error: '아직 커뮤니티가 없습니다.' }
+      if (mode !== 'basic' && mode !== 'oc') return { ok: false, error: '알 수 없는 커뮤니티 성격입니다.' }
+      if (settings.mode !== mode) {
+        settings.mode = mode
+        settings.updatedAt = now
+        // 화면 구성이 통째로 바뀐다 — 클라가 들고 있는 스냅샷을 전부 무효화한다.
+        settings.permVersion++
+        saveSettingsFile()
+      }
+      return { ok: true, value: settings }
+    },
+
     saveSettings(input, now) {
       if (!settings) return { ok: false, error: '아직 커뮤니티가 없습니다.' }
       const r = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
@@ -1372,9 +1413,12 @@ export function createCommunityStore(opts?: { dataDir?: string; persist?: boolea
         seen.add(bid)
         const prev = prevBoards.get(bid)
         // 종류는 만들 때 정해지고 이후 바뀌지 않는다 — 저장 형태가 종류에 묶여 있다.
+        // 보통 커뮤니티는 일반 게시판만 만들 수 있다(캐릭터·놀이 종류는 화면이 없다).
         const kind: BoardKind = prev
           ? prev.kind
-          : typeof b.kind === 'string' && CREATABLE_KINDS.has(b.kind as BoardKind)
+          : typeof b.kind === 'string' &&
+              CREATABLE_KINDS.has(b.kind as BoardKind) &&
+              (settings.mode === 'oc' || b.kind === 'general')
             ? (b.kind as BoardKind)
             : 'general'
         const categoryId = typeof b.categoryId === 'string' && catIds.has(b.categoryId) ? b.categoryId : cats[0].id

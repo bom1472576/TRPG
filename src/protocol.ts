@@ -1,10 +1,11 @@
 // 멀티플레이 와이어 프로토콜 (서버 ↔ 클라이언트 단일 계약).
+// 클라이언트 미러: src/renderer/src/net/protocol.ts — 이벤트/페이로드 변경 시 양쪽 동기화.
 //    ChatMessage 는 렌더러 lib/chat/types.ts 와 동일 구조(클라는 그쪽을 재사용).
 import type { DiceResult, SuccessLevel } from './dice/types'
 
 /** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
-export const SERVER_VERSION = '2026-07-26'
+export const SERVER_VERSION = '2026-07-28'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).

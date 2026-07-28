@@ -1148,6 +1148,69 @@ export class RoomStore {
     }
   }
 
+  /**
+   * 반쪽(축약) 저장이 담기는 비상 사본. 본 저장본(.json)과 이름을 갈라 두는 이유 —
+   * 반쪽이 본 저장본을 덮으면 거기 있던 옛 대화의 유일한 디스크 사본이 사라진다.
+   */
+  private rescuePath(id: string): string {
+    return join(this.roomDir, id + '.rescue.json')
+  }
+
+  /** 비상 사본을 방으로 읽는다(본 저장본과 같은 꼴). 없거나 못 읽으면 null. */
+  private roomFromRescue(id: string): Room | null {
+    try {
+      if (!existsSync(this.rescuePath(id))) return null
+      const room = roomFromFile(JSON.parse(readFileSync(this.rescuePath(id), 'utf8')))
+      return room && room.id === id ? room : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 비상 사본에만 남은 말을 채워 넣는다 — 기록장 쓰기가 실패했던 몫이 여기서 돌아온다.
+   * 기록장이 온전했다면 전부 이미 아는 말이라 0건으로 끝난다.
+   * 자리 잡기는 기록장 복구와 같은 규칙: 아는 말 뒤를 가리키는 자리를 옮겨 가며 모르는 말을 끼운다.
+   * 사본은 뜬 시점의 과거 상태다 — 그 뒤 기록장이 지웠거나(replay.deleted) 통째로 비운(replay.cleared)
+   * 말을 여기서 되살리면 안 된다. 지운 말이 부활하는 것이 놓친 말을 못 줍는 것보다 나쁘다.
+   */
+  private mergeRescue(room: Room, replay?: { deleted: Set<string>; cleared: boolean }): number {
+    if (replay?.cleared) return 0
+    const saved = this.roomFromRescue(room.id)
+    if (!saved) return 0
+    let applied = 0
+    const seen = new Set(room.messages.map((m) => m.id))
+    let at: number | null = null
+    let pending: ChatMessage[] = []
+    const placePending = (before: number): void => {
+      if (!pending.length) return
+      room.messages.splice(before, 0, ...pending)
+      pending = []
+    }
+    for (const m of saved.messages) {
+      if (!m.id) continue
+      if (replay?.deleted.has(m.id)) continue
+      if (seen.has(m.id)) {
+        const i = room.messages.findIndex((x) => x.id === m.id)
+        if (i >= 0) {
+          placePending(i)
+          at = room.messages.findIndex((x) => x.id === m.id) + 1
+        }
+        continue
+      }
+      if (at === null) pending.push(m)
+      else {
+        room.messages.splice(at, 0, m)
+        at++
+      }
+      seen.add(m.id)
+      applied++
+    }
+    placePending(room.messages.length)
+    if (room.messages.length > MAX_HISTORY) room.messages.splice(0, room.messages.length - MAX_HISTORY)
+    return applied
+  }
+
   /** 기록장 머리글만으로 방의 뼈대를 세운다(세션 파일이 없을 때의 마지막 수단). */
   private roomFromJournalHead(id: string): Room | null {
     try {
@@ -1172,9 +1235,12 @@ export class RoomStore {
    * 가릴 수 없다. 그래서 기록장을 훑으며 '아는 말 바로 뒤'를 가리키는 자리를 옮겨 가고,
    * 모르는 말은 그 자리에 끼워 넣는다. 기록장이 곧 오간 차례이므로 이러면 그대로 복원된다.
    */
-  private replayJournal(room: Room): number {
+  private replayJournal(room: Room): { applied: number; deleted: Set<string>; cleared: boolean } {
     const p = this.journalPath(room.id)
-    if (!existsSync(p)) return 0
+    /** 지운 말의 id 와 비움 여부 — 비상 사본 병합이 지난 상태를 되살리지 않도록 넘겨준다. */
+    const deleted = new Set<string>()
+    let cleared = false
+    if (!existsSync(p)) return { applied: 0, deleted, cleared }
     let applied = 0
     try {
       const seen = new Set(room.messages.map((m) => m.id))
@@ -1228,6 +1294,7 @@ export class RoomStore {
             applied++
           }
         } else if (e.op === 'del' && typeof e.id === 'string') {
+          deleted.add(e.id)
           const i = room.messages.findIndex((x) => x.id === e.id)
           if (i >= 0) {
             room.messages.splice(i, 1)
@@ -1248,6 +1315,7 @@ export class RoomStore {
           seen.clear()
           pending = []
           at = 0
+          cleared = true
           applied++
         }
       }
@@ -1257,49 +1325,81 @@ export class RoomStore {
     } catch (e) {
       console.error(`[rooms] ${room.id} 대화 기록장 복구 실패:`, e)
     }
-    return applied
+    return { applied, deleted, cleared }
   }
 
   private loadAll(): void {
     try {
       if (!existsSync(this.roomDir)) return
       for (const f of readdirSync(this.roomDir)) {
-        if (!f.endsWith('.json')) continue
+        // 비상 사본은 본 저장본이 아니다 — 방으로 읽지 않고 아래에서 합치는 재료로만 쓴다.
+        if (!f.endsWith('.json') || f.endsWith('.rescue.json')) continue
         try {
           const room = roomFromFile(JSON.parse(readFileSync(join(this.roomDir, f), 'utf8')))
           if (room) {
             // 스냅샷 이후에 오간 말을 이어붙인다 — 지난번에 저장되지 못한 몫이 여기 남아 있다.
             const back = this.replayJournal(room)
-            if (back) console.log(`[rooms] ${room.title || room.id}: 저장되지 않았던 대화 ${back}건 복구`)
+            if (back.applied) console.log(`[rooms] ${room.title || room.id}: 저장되지 않았던 대화 ${back.applied}건 복구`)
+            // 기록장까지 놓친 말이 비상 사본에 남았을 수 있다(기록장 쓰기가 실패했던 방).
+            const extra = this.mergeRescue(room, back)
+            if (extra) {
+              this.saveLoss.set(room.id, `기록장이 놓친 대화 ${extra}건을 비상 사본에서 되살렸습니다`)
+              console.log(`[rooms] ${room.title || room.id}: 비상 사본에서 대화 ${extra}건 복구`)
+            }
             this.rooms.set(room.id, room)
             this.codeToId.set(room.code, room.id)
             // 되살린 몫은 아직 스냅샷에 없다 — 저장 대상으로 표시해 다음 자동저장이 접어 넣게 한다.
             // (그러지 않으면 그 방은 조용한 동안 영영 저장되지 않고 기록장만 계속 불어난다.)
-            this.savedAt.set(room.id, back ? 0 : room.lastActivityAt)
+            this.savedAt.set(room.id, back.applied || extra ? 0 : room.lastActivityAt)
           }
         } catch (e) {
           this.saveLoss.set(f.replace(/\.json$/, ''), `세션 파일을 읽지 못했습니다: ${String(e)}`)
           console.error(`[rooms] ${f} 로드 실패:`, e)
         }
       }
-      // 세션 파일 없이 기록장만 남은 방 — 머리글로 방을 세우고 대화를 되살린다.
+      // 세션 파일 없이 기록장만 남은 방 — 되살린다.
       // (세션이 처음 저장되기 전에 서버가 내려갔거나, 디스크가 차 큰 저장만 계속 실패한 경우다.)
       for (const f of readdirSync(this.roomDir)) {
         if (!f.endsWith('.chat.jsonl')) continue
         const id = f.slice(0, -'.chat.jsonl'.length)
         if (this.rooms.has(id)) continue
-        const rebuilt = this.roomFromJournalHead(id)
+        // 비상 사본이 있으면 그쪽이 온전한 그릇이다(맵·자료까지 담고 있다). 없으면 머리글로 뼈대만 세운다.
+        const rescue = this.roomFromRescue(id)
+        const rebuilt = rescue && !this.codeToId.has(rescue.code) ? rescue : this.roomFromJournalHead(id)
         if (!rebuilt) {
           this.saveLoss.set(id, '세션 파일도 머리글도 없어 되살리지 못한 대화 기록이 남아 있습니다')
           console.error(`[rooms] ${f}: 짝이 되는 세션 파일이 없습니다.`)
           continue
         }
         const back = this.replayJournal(rebuilt)
+        if (rescue && rebuilt !== rescue) this.mergeRescue(rebuilt, back)
         this.rooms.set(rebuilt.id, rebuilt)
         this.codeToId.set(rebuilt.code, rebuilt.id)
-        this.savedAt.set(rebuilt.id, 0) // 아직 스냅샷이 없다 — 다음 자동저장이 반드시 쓰게
-        this.saveLoss.set(id, `세션 파일이 없어 대화 기록만으로 되살렸습니다(대화 ${back}건 · 맵·자료는 복구 대상이 아닙니다)`)
-        console.log(`[rooms] ${rebuilt.title || rebuilt.id}: 세션 파일 없이 대화 ${back}건을 되살렸습니다.`)
+        this.savedAt.set(rebuilt.id, 0) // 아직 본 저장본이 없다 — 다음 자동저장이 반드시 쓰게
+        this.saveLoss.set(
+          id,
+          rescue
+            ? `세션 파일이 없어 비상 사본과 대화 기록으로 되살렸습니다(대화 ${back.applied}건 복구)`
+            : `세션 파일이 없어 대화 기록만으로 되살렸습니다(대화 ${back.applied}건 · 맵·자료는 복구 대상이 아닙니다)`
+        )
+        console.log(`[rooms] ${rebuilt.title || rebuilt.id}: 세션 파일 없이 대화 ${back.applied}건을 되살렸습니다.`)
+      }
+      // 기록장조차 없이 비상 사본만 남은 방 — 그것이라도 세운다.
+      for (const f of readdirSync(this.roomDir)) {
+        if (!f.endsWith('.rescue.json')) continue
+        const id = f.slice(0, -'.rescue.json'.length)
+        if (this.rooms.has(id)) continue
+        const room = this.roomFromRescue(id)
+        if (!room || this.codeToId.has(room.code)) {
+          // 조용히 넘어가면 그 방이 왜 사라졌는지 아무도 모른다 — 사실만은 남긴다.
+          this.saveLoss.set(id, '비상 사본만 남았는데 되살리지 못했습니다(손상되었거나 방 코드가 겹칩니다)')
+          continue
+        }
+        this.rooms.set(room.id, room)
+        this.codeToId.set(room.code, room.id)
+        this.savedAt.set(room.id, 0)
+        this.saveLoss.set(id, '본 저장본이 없어 비상 사본으로 되살렸습니다(덜어냈던 옛 대화는 복구하지 못했습니다)')
+        console.log(`[rooms] ${room.title || room.id}: 비상 사본으로 되살렸습니다.`)
       }
       console.log(`[rooms] 영속 세션 ${this.rooms.size}개 로드`)
     } catch (e) {
@@ -1314,6 +1414,8 @@ export class RoomStore {
    */
   private flush(room: Room): Promise<void> {
     if (!this.persist) return Promise.resolve()
+    // 지워진 방은 쓰지 않는다 — 예약된 뒤따라 쓰기가 삭제 뒤에 도착하면 지운 파일이 되살아난다.
+    if (!this.rooms.has(room.id)) return Promise.resolve()
     const inFlight = this.flushing.get(room.id)
     if (inFlight) {
       // 앞선 쓰기가 아직 안 끝났다. 볼륨이 매달리면 이 표시가 영영 안 풀려 그 방만 조용히 저장을 멈춘다 —
@@ -1337,7 +1439,7 @@ export class RoomStore {
     }
     let json: string
     let at: number
-    /** 이번 저장이 오래된 대화를 덜어낸 반쪽인가 — 그렇다면 기록장을 건드리면 안 된다. */
+    /** 이번 저장이 오래된 대화를 덜어낸 반쪽인가 — 그렇다면 기록장·본 저장본을 건드리면 안 된다. */
     let trimmedSave = false
     try {
       at = room.lastActivityAt
@@ -1352,8 +1454,11 @@ export class RoomStore {
         console.error(`[rooms] ${room.id}(${room.title}) 직렬화 실패 — 줄여서도 저장하지 못했다:`, e)
         return Promise.resolve()
       }
-      this.saveLoss.set(room.id, `너무 커서 오래된 대화 ${kept.dropped}개를 스냅샷에서 덜어냈습니다(기록장에는 남아 있습니다)`)
-      console.error(`[rooms] ${room.id}(${room.title}) 너무 큼 — 오래된 대화 ${kept.dropped}개를 덜어내고 저장한다.`)
+      this.saveTrouble.set(
+        room.id,
+        `방이 너무 커서 온전한 저장이 실패했습니다 — 대화는 이전 저장본·기록장·비상 사본으로 지키는 중입니다`
+      )
+      console.error(`[rooms] ${room.id}(${room.title}) 너무 큼 — 최근 대화 스냅샷을 비상 사본에 둔다(덜어낸 ${kept.dropped}개는 이전 저장본과 기록장 몫).`)
       json = kept.json
       at = room.lastActivityAt
       trimmedSave = true
@@ -1362,18 +1467,42 @@ export class RoomStore {
     // 이 스냅샷이 담아낸 지점 — 저장이 끝난 뒤 여기까지만 덜어낸다(그 사이 들어온 말은 남긴다).
     // 반쪽 저장이면 0 — 스냅샷이 담지 못한 대화의 유일한 사본이 기록장이므로 한 줄도 지우지 않는다.
     const cut = trimmedSave ? 0 : this.journalSize(room.id)
-    const f = join(this.roomDir, room.id + '.json')
+    // 반쪽 저장은 본 저장본을 덮지 않는다. 이전 온전 스냅샷은 기록장이 이미 덜어낸(그래서 다른 사본이 없는)
+    // 옛 대화의 유일한 그릇이라, 반쪽으로 덮는 순간 그 대화가 디스크에서 사라진다. 비상 사본에 따로 둔다.
+    const f = trimmedSave ? this.rescuePath(room.id) : join(this.roomDir, room.id + '.json')
     const tmp = f + '.tmp'
     const work = (async () => {
       try {
         await mkdir(this.roomDir, { recursive: true })
         await writeFile(tmp, json, 'utf8')
         await rename(tmp, f)
+        // 쓰는 사이 방이 지워졌으면 방금 쓴 파일도 걷는다 — 지운 방이 다음 기동에서 되살아나지 않게.
+        if (!this.rooms.has(room.id)) {
+          try {
+            await unlink(f)
+          } catch {
+            /* 이미 걷혔으면 그만 */
+          }
+          return
+        }
         // 반쪽 저장은 '다 저장했다'가 아니다 — 다음 주기에 온전한 저장을 다시 노린다.
         if (!trimmedSave) {
           this.savedAt.set(room.id, at)
-          this.trimJournal(room.id, cut) // 스냅샷에 담긴 몫만 덜어낸다
-          this.saveTrouble.delete(room.id)
+          // 비상 사본부터 걷는다. 기록장을 먼저 비우면, 그 사이 죽었을 때 '지웠다'는 기록 없는
+          // 낡은 사본만 남아 다음 기동에서 지운 말이 되살아난다. 사본을 못 걷었으면 기록장도 남긴다.
+          let rescueGone = true
+          if (existsSync(this.rescuePath(room.id))) {
+            try {
+              await unlink(this.rescuePath(room.id))
+            } catch (e) {
+              rescueGone = false
+              this.saveTrouble.set(room.id, `비상 사본 정리 실패: ${String(e)}`)
+            }
+          }
+          if (rescueGone) {
+            this.trimJournal(room.id, cut) // 스냅샷에 담긴 몫만 덜어낸다
+            this.saveTrouble.delete(room.id)
+          }
         }
       } catch (e) {
         // 디스크가 찼거나 볼륨이 떨어져 나간 경우다. 조용히 넘어가면 서버가 도는 동안에는 아무도 모르다가
@@ -1454,6 +1583,8 @@ export class RoomStore {
       if (existsSync(f)) unlinkSync(f)
       const j = this.journalPath(id)
       if (existsSync(j)) unlinkSync(j)
+      const r = this.rescuePath(id)
+      if (existsSync(r)) unlinkSync(r)
     } catch (e) {
       console.error(`[rooms] ${id} 파일 삭제 실패:`, e)
     }

@@ -1,3 +1,4 @@
+// 렌더러 src/renderer/src/lib/dice/engine.ts 의 미러본. 다이스 규칙 변경 시 양쪽을 함께 고친다.
 // 순수 함수 + RNG 주입 구조라 서버 권위 굴림에 그대로 쓴다.
 import type { CheckResult, SanResult, SumResult, SuccessLevel, DiceResult, OpposedResult } from './types'
 import { SUCCESS_LABEL } from './types'

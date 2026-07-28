@@ -1,3 +1,4 @@
+// 렌더러 src/renderer/src/lib/dice/types.ts 의 미러본. 다이스 규칙·타입 변경 시 양쪽을 함께 고친다.
 // ===== 다이스/판정 결과 타입 =====
 
 export type SuccessLevel =

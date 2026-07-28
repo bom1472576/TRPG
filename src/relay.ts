@@ -1793,7 +1793,15 @@ export function createRelay(opts?: {
         res.writeHead(200, JSON_H)
         // 저장이 말썽인 방은 반드시 눈에 띄어야 한다 — 그대로 두면 재시작하는 순간 그 사이 대화가 사라진다.
         res.end(
-          JSON.stringify({ ok: true, summary, users, communityEnabled: community.enabled(), saveTroubles: store.saveTroubles() })
+          JSON.stringify({
+            ok: true,
+            summary,
+            users,
+            communityEnabled: community.enabled(),
+            // 커뮤니티 성격 — 아직 안 열었으면 null. 서버 관리 화면의 전환 손잡이가 쓴다.
+            communityMode: community.settings()?.mode ?? null,
+            saveTroubles: store.saveTroubles()
+          })
         )
       })
       return
@@ -4865,11 +4873,25 @@ export function createRelay(opts?: {
     }
     socket.on('cmty:watch', (req) => {
       cmtyLeave()
+      const acct = socket.data.account
+      if (!acct) return
       const rooms: string[] = ['cmty:main']
       const boardId = typeof req?.boardId === 'string' ? req.boardId : ''
       const postId = typeof req?.postId === 'string' ? req.postId : ''
-      if (community.board(boardId)) rooms.push('cmtyb:' + boardId)
-      if (postId && cmtyPosts.summary(postId)) rooms.push('cmtyp:' + postId)
+      // 존재만 보고 들여보내면 숨긴 게시판의 활동이 그대로 새 나간다 — 읽을 수 있는 사람만 들인다.
+      const permCtx = {
+        accountId: acct.id,
+        isAppAdmin: acct.role === 'admin',
+        member: community.member(acct.id),
+        now: Date.now()
+      }
+      const board = community.board(boardId)
+      if (board && community.can('board.read', { ...permCtx, board })) rooms.push('cmtyb:' + boardId)
+      if (postId) {
+        const sum = cmtyPosts.summary(postId)
+        const pb = sum ? community.board(sum.boardId) : null
+        if (pb && community.can('board.read', { ...permCtx, board: pb })) rooms.push('cmtyp:' + postId)
+      }
       for (const r of rooms) void socket.join(r)
       socket.data.cmtyRooms = rooms
     })

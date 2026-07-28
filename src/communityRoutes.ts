@@ -35,6 +35,8 @@ function boardOfPost(d: CommunityRouteDeps, postId: string): Board | null {
  * 이 문화에서 '누가 말했는가'는 곧 그 사람의 신원이라, 여기가 뚫리면 뒤에서 되돌릴 방법이 없다.
  */
 function speakingAs(c: Ctx, d: CommunityRouteDeps, raw: unknown): { ok: true; charId: string; charName: string } | { ok: false; error: string } {
+  // 보통 커뮤니티에는 캐릭터 명의가 없다 — 무엇이 와도 계정 명의로 접는다(옛 자료가 남아 있어도).
+  if (d.community.settings()?.mode === 'basic') return { ok: true, charId: '', charName: '' }
   const charId = s(raw, 64)
   if (!charId) return { ok: true, charId: '', charName: '' }
   const doc = d.chars.get(charId)
@@ -74,6 +76,17 @@ function anonymize<T extends Spoken>(x: T, c: Ctx, board: Board | null): T {
   return { ...x, authorId: '', authorNick: '익명', authorAvatar: '', charId: '', charName: '' }
 }
 
+/**
+ * 소켓 룸으로 나가는 댓글 사본 — 받을 사람을 고를 수 없으므로 나가기 전에 지운다.
+ * 익명 게시판이면 쓴 사람을, 비밀 댓글이면 본문을 지워 '무언가 달렸다'만 알린다(열람은 HTTP 가 권한대로).
+ */
+function maskLive<T extends Spoken & { secret?: boolean; text: string; images: string[] }>(x: T, c: Ctx): T {
+  let out = x
+  if (out.secret) out = { ...out, text: '', images: [] }
+  if (c.board?.anonymous) out = { ...out, authorId: '', authorNick: '익명', authorAvatar: '', charId: '', charName: '' }
+  return out
+}
+
 /** 이 사람이 이 글을 볼 수 있는가 — 공개 범위와 게시판 권한을 함께 본다. */
 function canSeePost(c: Ctx, authorId: string, visibility: string): boolean {
   if (visibility === 'all') return true
@@ -107,11 +120,13 @@ const BOARD_ROUTES: Record<string, Route> = {
       const permCtx = { accountId: c.account.id, isAppAdmin: c.isAppAdmin, member: c.member, now: c.now }
       const boards = d.community.visibleBoards(permCtx)
       const snap = d.community.permSnapshot(permCtx)
-      const mine = d.chars.ownedBy(c.account.id)
+      // 보통 커뮤니티는 캐릭터·경제 몫을 아예 싣지 않는다 — 모드를 모르는 옛 클라도 메뉴가 없으면 그 화면에 못 간다.
+      const oc = set.mode !== 'basic'
       return ok({
         enabled: true,
         community: {
           cid: set.cid,
+          mode: set.mode,
           name: set.name,
           tagline: set.tagline,
           logo: set.logo,
@@ -121,7 +136,7 @@ const BOARD_ROUTES: Record<string, Route> = {
           labels: set.labels,
           roles: set.roles,
           categories: set.categories,
-          menu: set.menu,
+          menu: oc ? set.menu : set.menu.filter((m) => !m.builtin || m.builtin === 'home'),
           permVersion: set.permVersion,
           hasApplyForm: set.applyForm.length > 0
         },
@@ -129,12 +144,12 @@ const BOARD_ROUTES: Record<string, Route> = {
         member: c.member,
         perms: snap.cmty,
         boardPerms: snap.boards,
-        myChars: mine,
-        statSchema: d.chars.schema(),
-        econ: set.econ,
+        myChars: oc ? d.chars.ownedBy(c.account.id) : [],
+        statSchema: oc ? d.chars.schema() : null,
+        econ: oc ? set.econ : null,
         // 첫 화면에서 바로 보여야 하는 것들 — 선물함에 뭔가 와 있는지, 대표 캐릭터를 정했는지.
-        pendingGifts: d.gifts.listFor(c.account.id).incoming.length,
-        hasMain: !!d.chars.mainOf(c.account.id),
+        pendingGifts: oc ? d.gifts.listFor(c.account.id).incoming.length : 0,
+        hasMain: oc ? !!d.chars.mainOf(c.account.id) : false,
         // 게시판마다 마지막 글이 언제인지 — 화면이 '내가 본 때'와 견줘 ●NEW 를 가른다.
         lastPostAt: d.posts.lastPostAt(c.now)
       })
@@ -273,7 +288,8 @@ const BOARD_ROUTES: Record<string, Route> = {
       if (!postId && !r.value.draft) {
         d.community.bumpStat(c.account.id, 'posts', 1, c.now)
         // 활동 정산 — 대표 캐릭터가 없거나 꺼져 있으면 조용히 아무 일도 하지 않는다.
-        d.econ.activity(c.account.id, 'post', c.now)
+        // 보통 커뮤니티는 경제 자체가 닫혀 있다 — 아무도 볼 수 없는 지갑이 몰래 자라게 두지 않는다.
+        if (d.community.settings()?.mode !== 'basic') d.econ.activity(c.account.id, 'post', c.now)
         // 구독자에게만 새 글을 알린다(전원 알림은 곧 알림을 무시하게 만든다).
         for (const sub of d.community.subscribers(r.value.boardId, c.account.id)) {
           d.notify(sub, { kind: 'cmty', actor: d.actorOf(c.account), ref: r.value.id, text: r.value.title })
@@ -392,7 +408,7 @@ const BOARD_ROUTES: Record<string, Route> = {
       const r = d.posts.addComment(postId, { id: c.account.id, nick, avatar: c.account.avatar ?? '' }, body, c.now)
       if (!r.ok) return fail(r.error)
       d.community.bumpStat(c.account.id, 'comments', 1, c.now)
-      d.econ.activity(c.account.id, 'comment', c.now)
+      if (d.community.settings()?.mode !== 'basic') d.econ.activity(c.account.id, 'comment', c.now)
 
       const actor = d.actorOf(c.account)
       const parent = r.value.parentId ? d.posts.comments(postId).find((x) => x.id === r.value.parentId) : null
@@ -405,9 +421,7 @@ const BOARD_ROUTES: Record<string, Route> = {
         d.notify(sum.authorId, { kind: 'cmty', actor, ref: postId, text: r.value.text })
         d.community.bumpStat(sum.authorId, 'received', 1, c.now)
       }
-      // 실시간으로 흘리는 사본에도 익명을 걸어야 한다 — 방으로 나가는 값은 누가 받을지 고르지 못한다.
-      const live = c.board?.anonymous ? { ...r.value, authorId: '', authorNick: '익명', authorAvatar: '', charId: '', charName: '' } : r.value
-      d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'new', comment: live })
+      d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'new', comment: maskLive(r.value, c) })
       return ok({ comment: r.value })
     }
   },
@@ -419,7 +433,7 @@ const BOARD_ROUTES: Record<string, Route> = {
     run(b, c, d) {
       const postId = s(b.postId, 64)
       const r = d.posts.editComment(s(b.commentId, 64), postId, c.account.id, b.text, c.now)
-      if (r.ok) d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'edit', comment: r.value })
+      if (r.ok) d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'edit', comment: maskLive(r.value, c) })
       return from(r, 'comment')
     }
   },
@@ -430,7 +444,7 @@ const BOARD_ROUTES: Record<string, Route> = {
     run(b, c, d) {
       const postId = s(b.postId, 64)
       const r = d.posts.removeComment(s(b.commentId, 64), postId, c.account.id, c.can('board.deleteAny'), c.now)
-      if (r.ok) d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'remove', comment: r.value })
+      if (r.ok) d.emitTo('cmtyp:' + postId, 'cmty:comment', { postId, op: 'remove', comment: maskLive(r.value, c) })
       return from(r, 'comment')
     }
   },
@@ -530,11 +544,28 @@ const BOARD_ROUTES: Record<string, Route> = {
   // ── 운영 ────────────────────────────────────────────────────────────────
   '/cmty/admin/create': {
     need: 'login',
-    run(_b, c, d) {
+    run(b, c, d) {
       if (!c.isAppAdmin) return fail('서버 주인만 커뮤니티를 열 수 있습니다.', 403)
-      const set = d.community.ensure(c.account.id, c.now)
+      // 성격은 열 때 한 번 정해진다. 화면은 보통 커뮤니티만 내준다 — oc 값은 자캐 판이 열리기 전까지
+      // 시험 하네스만 쓰는 뒷문이다(서버 주인 자격이 있어야만 닿는다).
+      const set = d.community.ensure(c.account.id, c.now, b.mode === 'oc' ? 'oc' : 'basic')
       c.audit('community.create', set.name)
       return ok({ community: set })
+    }
+  },
+  '/cmty/admin/mode': {
+    need: 'login',
+    run(b, c, d) {
+      // 성격 전환은 화면 구성이 통째로 바뀌는 일이라 커뮤니티 역할이 아니라 서버 주인의 몫이다.
+      if (!c.isAppAdmin) return fail('서버 주인만 커뮤니티 성격을 바꿀 수 있습니다.', 403)
+      // 자캐 쪽은 아직 다듬는 중이다 — 코드는 있어도 문은 열지 않는다(보통 판으로 접는 방향만 연다).
+      if (b.mode === 'oc') return fail('자캐(캐릭터) 커뮤니티는 아직 개발 중이라 이용할 수 없습니다.')
+      const r = d.community.setMode(b.mode, c.now)
+      if (!r.ok) return fail(r.error)
+      c.audit('community.mode', r.value.mode === 'oc' ? '캐릭터 커뮤니티' : '보통 커뮤니티')
+      // 보고 있던 화면들이 새 구성을 받아 오게 한다(붙박이 메뉴·게시판·권한 스냅샷이 전부 달라진다).
+      d.emitTo('cmty:main', 'cmty:perm', { permVersion: r.value.permVersion })
+      return ok({ community: { mode: r.value.mode } })
     }
   },
   '/cmty/admin/settings': {
@@ -753,6 +784,25 @@ const BOARD_ROUTES: Record<string, Route> = {
 const ROUTES: Record<string, Route> = { ...BOARD_ROUTES, ...ECON_ROUTES, ...GAME_ROUTES }
 
 /**
+ * 캐릭터 커뮤니티에서만 여는 길.
+ * 보통(basic) 커뮤니티는 게시판만 쓰므로, 캐릭터·경제·놀이 쪽은 존재하지 않는 것으로 답한다 —
+ * 화면에서 숨기는 것만으로는 손으로 빚은 요청까지 막지 못한다.
+ */
+const OC_ONLY = new Set<string>([
+  ...Object.keys(ECON_ROUTES),
+  ...Object.keys(GAME_ROUTES),
+  '/cmty/char/list',
+  '/cmty/char/get',
+  '/cmty/char/save',
+  '/cmty/char/remove',
+  '/cmty/char/look',
+  '/cmty/char/relation',
+  '/cmty/admin/schema',
+  '/cmty/admin/char/status',
+  '/cmty/admin/char/stats'
+])
+
+/**
  * 커뮤니티 라우트 처리기. 이 요청을 맡았으면 true 를 돌려준다(응답까지 끝냈다는 뜻).
  * relay 의 라우트 사슬에서 '웹 정적 서빙보다 앞'에 꽂아야 한다.
  */
@@ -774,6 +824,10 @@ export function createCommunityRoutes(d: CommunityRouteDeps) {
       if (!d.community.enabled() && req.url !== '/cmty/state') {
         if (req.url === '/cmty/bootstrap') return send(ok({ enabled: false, community: null, canCreate: false }))
         return send(fail('이 서버는 커뮤니티 기능을 쓰지 않습니다.', 403))
+      }
+      // 보통 커뮤니티에는 캐릭터·경제·놀이 길이 없다. 커뮤니티가 아직 없을 때도 같은 답을 준다.
+      if (OC_ONLY.has(req.url ?? '') && d.community.settings()?.mode !== 'oc') {
+        return send(fail('이 커뮤니티에서는 쓰지 않는 기능입니다.', 404))
       }
       if (route.rate === 'social' && d.socialLimited(account.id, res)) return
       if (route.rate === 'econ' && d.econLimited(account.id, res)) return
