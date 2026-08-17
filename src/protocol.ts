@@ -5,7 +5,7 @@ import type { DiceResult, SuccessLevel } from './dice/types'
 
 /** 서버 프로그램 버전(배포 스냅샷 날짜) — GET /health 의 ver 로 노출. 클라이언트가 자가호스팅
  *  서버의 구버전 여부를 판별하는 근거이므로, 서버 기능이 바뀔 때마다 그 날짜로 갱신한다. */
-export const SERVER_VERSION = '2026-08-02'
+export const SERVER_VERSION = '2026-08-13'
 
 export type ChatChannel = 'main' | 'ooc' | 'whisper' | 'group'
 // script = /desc 프로필 없는 꾸미기 스크립트(클라가 아바타·이름 없이 꾸미기 마크업으로 렌더).
@@ -174,6 +174,13 @@ export interface SharedCharacter {
 export type CharUpdateReq = Omit<SharedCharacter, 'playerId'>
 
 /**
+ * char:identity 요청 — 스탠딩을 뺀 '누구로 말하는가'만 담은 가벼운 발행.
+ * 스탠딩은 대형 이미지라 자산 업로드를 기다렸다 나가는데, 그 사이 친 말은 옛 정체성으로 각인된다.
+ * 그래서 업로드가 필요 없는 것만 먼저 보내 이름·색·두상을 즉시 맞추고, 스탠딩은 뒤이은 char:update 가 채운다.
+ */
+export type CharIdentityReq = Omit<CharUpdateReq, 'standings'>
+
+/**
  * 계정 영속용 캐릭터 시트 "전체". 서버는 내용을 해석하지 않고 불투명 블롭으로 저장 —
  * 도메인 타입(능력치·기능 등)은 렌더러 lib/coc/types 소유. id 만 보장. 클라 protocol 과 미러.
  */
@@ -253,6 +260,11 @@ export interface Token {
   /** 회전 각도(라디안). GM·소유 PL 이 회전 가능(token:rotate). 기본 0. */
   rotation?: number
   charPlayerId?: string
+  /**
+   * 이 토큰이 가리키는 캐릭터(시트) id. 한 사람이 여러 저널을 오가며 쓰는 방에서, 토큰마다 어느
+   * 캐릭터의 것인지 붙잡아 둔다. 없으면 예전처럼 그 사람이 지금 장착한 캐릭터를 따라간다.
+   */
+  charId?: string
   label?: string
   color?: string
   image?: string // data URL (NPC 토큰·이미지 오브젝트)
@@ -329,6 +341,7 @@ export interface TokenUpsertReq {
   h?: number
   rotation?: number
   charPlayerId?: string
+  charId?: string
   label?: string
   color?: string
   image?: string
@@ -564,8 +577,8 @@ export interface CombatState {
 }
 
 /**
- * 그룹 채널(GM 개설) — members(+GM)에게만 보이고 전달됨. 채널 자체는 영속,
- * 메시지는 휘발(귓속말처럼 공유 히스토리 미저장). 클라 protocol 과 미러.
+ * 그룹 채널(GM 개설) — members(+GM)에게만 보이고 전달됨. 채널과 메시지 모두 영속이며,
+ * 귓속말과 같이 히스토리에 저장하되 내보낼 때 뷰어별로 거른다(재입장 보존). 클라 protocol 과 미러.
  */
 export interface Channel {
   id: string
@@ -595,7 +608,15 @@ export interface RoomState {
   cardImage?: string
   participants: Participant[]
   characters: SharedCharacter[]
+  /**
+   * 캐릭터 보관대 — 지금 아무도 장착하지 않은 캐릭터까지 담는다.
+   * 맵 토큰이 charId 로 자기 캐릭터를 찾을 때 쓴다(로스터에 없으면 여기서). 옛 서버는 안 보낸다.
+   */
+  charPool?: SharedCharacter[]
   messages: ChatMessage[]
+  /** 여기 실린 대화보다 앞선 몫이 보관소에 남아 있는가 — 채팅 창의 '보관된 이전 대화 불러오기' 표시 조건.
+   *  옛 서버는 안 보낸다(그 경우 보관소 자체가 없다). */
+  archived?: boolean
   handouts: Handout[]
   /** 방의 모든 맵세트. */
   maps: GameMap[]
@@ -603,6 +624,8 @@ export interface RoomState {
   activeMapId: string
   /** 방 외형(방 GM 강제 테마·다이스 카드). 입장 시 클라가 적용. */
   appearance: Appearance
+  /** 입실 잠금(공사중) — 켜면 방을 만든 사람 말고는 새로 들어올 수 없다. GM 토글·전원 동기화·영속. */
+  locked?: boolean
   /** 방 BGM 트랙들(GM 제어·전원 동기화). 빈 배열=정지/없음. 최대 5개 동시재생. 입장 시 클라가 적용. */
   bgm: BgmState[]
   /** 방 전투 상태(GM 제어·전원 동기화). null=전투 없음. */
@@ -706,6 +729,27 @@ export interface ChatRollReq {
   to?: string
   groupId?: string
   secret?: boolean
+}
+
+/**
+ * 보관된 지난 대화 되읽기 요청.
+ * 방이 메모리에 들고 있는 몫보다 앞선 대화는 보관소에 남아 있고, 이 요청으로 뒤에서부터 한 묶음씩 가져온다.
+ */
+export interface ChatOlderReq {
+  /** 이어 읽을 지점 — 앞선 응답이 준 것을 그대로 돌려준다. 없으면 보관소의 맨 끝부터. */
+  cursor?: { part: number; line: number }
+  /** 한 번에 받을 대화 수(서버가 상한으로 깎는다). */
+  limit?: number
+}
+
+/** 되읽기 응답 — 입장 스냅샷과 같은 꼴(두상은 풀로 분리). */
+export interface ChatOlderRes {
+  /** 오래된 순으로 정렬된 보관 대화. 열람권이 없는 것은 빠져 있다. */
+  messages: ChatMessage[]
+  /** 두상 풀 — messages 의 avatarRef 가 가리킨다(입장 스냅샷과 동일). */
+  avatarPool?: string[]
+  /** 다음에 이어 읽을 지점. null 이면 보관소를 끝까지 읽었다. */
+  cursor: { part: number; line: number } | null
 }
 
 /** 핸드셰이크 시 socket.handshake.auth 로 전달. */
@@ -892,7 +936,7 @@ export interface ClientToServerEvents {
   // 클라가 굴린 결과(시트 주사위·광기) 중계 — 서버가 정체성 스탬프·라우팅·히스토리·브로드캐스트.
   'chat:roll': (req: ChatRollReq) => void
   // 행운 성공 전환 안내 — 서버가 정체성 스탬프 후 kind='luck' 카드로 브로드캐스트(공개·히스토리).
-  'chat:luck': (req: { channel: ChatChannel; cost: number; remaining: number; command: string }) => void
+  'chat:luck': (req: { channel: ChatChannel; groupId?: string; cost: number; remaining: number; command: string }) => void
   // 상태 수치 변화 기록 — 시트에서 체력·정신력·이성이 바뀌면 방 기록에 한 줄 남긴다(서버가 발신자 정체성 스탬프).
   'chat:stat': (req: { channel: ChatChannel; label: string; from: number; to: number; max?: number }) => void
   // GM 선택지 — 채팅에 버튼 선택지 게시. 서버는 옵션 스크립트를 숨기고 라벨만 브로드캐스트. 색은 그대로 전달.
@@ -909,10 +953,15 @@ export interface ClientToServerEvents {
   // 보낸 채팅 수정/삭제. 수정=작성자 본인 또는 GM(텍스트 메시지만), 삭제=GM 만. 서버가 검증 후 브로드캐스트.
   'chat:edit': (req: { id: string; text: string }) => void
   'chat:delete': (req: { id: string }) => void
+  // 보관된 지난 대화 되읽기 — 방이 메모리에 들고 있는 몫보다 앞선 대화를 뒤에서부터 한 묶음씩.
+  // cursor 는 서버가 준 것을 그대로 돌려주면 되고, 없으면 보관소의 맨 끝부터. 열람권은 서버가 거른다.
+  'chat:older': (req: ChatOlderReq, ack: Ack<ChatOlderRes>) => void
   // 입력 중 표시(휘발) — 타이핑 시작/정지를 방 전체에 알림(저장 안 함). channel/groupId 로 어느 탭에서 치는지 전달.
   'chat:typing': (req: { typing: boolean; channel?: ChatChannel; groupId?: string }) => void
   // 캐릭터 프레즌스 공유. playerId 는 서버가 스탬프.
   'char:update': (req: CharUpdateReq) => void
+  // 스탠딩을 뺀 정체성만 즉시 반영(업로드 대기 없음) — 갈아입자마자 친 말이 옛 캐릭터로 찍히지 않게.
+  'char:identity': (req: CharIdentityReq) => void
   'char:expr': (req: { index: number }) => void
   // 캐릭터 시트 영속 (인증 계정 전용). 시트 전체를 계정에 저장/삭제.
   'char:save': (req: CharacterRecord) => void
@@ -941,6 +990,8 @@ export interface ClientToServerEvents {
   // GM 전용: ~문장~ 행동지문 색 설정/해제(빈값=해제). 전원 동기화.
   'room:dim': (req: { color?: string }) => void
   'room:luck': (req: { enabled: boolean }) => void
+  /** 입실 잠금(공사중) — 방을 만든 사람만 켜고 끈다. 켜면 새로 들어오는 사람을 막는다. */
+  'room:lock': (req: { locked: boolean }) => void
   // GM 전용: 일반 맵 VN 오버레이 표시 토글. 전원 동기화.
   'room:vnoverlay': (req: { enabled: boolean }) => void
   // GM 커스텀 광기표 설정(GM 전용) — 서버 정규화 후 전원 동기화.
@@ -1163,6 +1214,8 @@ export interface ServerToClientEvents {
   // ~문장~ 행동지문 색 브로드캐스트 — GM 설정 시 전원 동기화(빈값=해제).
   'room:dim': (req: { color?: string }) => void
   'room:luck': (req: { enabled: boolean }) => void
+  /** 입실 잠금(공사중) — 방을 만든 사람만 켜고 끈다. 켜면 새로 들어오는 사람을 막는다. */
+  'room:lock': (req: { locked: boolean }) => void
   // VN 오버레이 표시 브로드캐스트 — GM 토글 시 전원 동기화.
   'room:vnoverlay': (req: { enabled: boolean }) => void
   // GM 커스텀 광기표 브로드캐스트.
